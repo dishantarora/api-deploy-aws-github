@@ -1,0 +1,111 @@
+name: Apply Terraform environment
+description: Build and deploy the API infrastructure for one environment, then restore the prior Lambda alias if deployment or smoke checking fails.
+inputs:
+  environment-name:
+    description: Environment label (dev, staging, or prod)
+    required: true
+  aws-role-arn:
+    description: Environment-specific IAM role assumed through GitHub OIDC
+    required: true
+  aws-region:
+    description: AWS region where application resources are managed
+    required: true
+  state-bucket:
+    description: S3 bucket storing Terraform state
+    required: true
+  state-region:
+    description: AWS region containing the Terraform state bucket
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v7
+
+    - uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: 1.14.6
+        terraform_wrapper: false
+
+    - name: Remember current Lambda version
+      id: previous
+      shell: bash
+      env:
+        STAGE: ${{ inputs.environment-name }}
+      run: |
+        set +e
+        version="$(aws lambda get-alias \
+          --function-name "api-${STAGE}" \
+          --name live \
+          --query FunctionVersion \
+          --output text 2>/dev/null)"
+        status=$?
+        set -e
+
+        if [[ $status -eq 0 && "$version" =~ ^[0-9]+$ ]]; then
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Captured existing live version $version."
+        else
+          echo "No existing live version found; this may be the first deployment."
+        fi
+
+    - name: Initialize Terraform state
+      shell: bash
+      env:
+        AWS_REGION: ${{ inputs.aws-region }}
+        STAGE: ${{ inputs.environment-name }}
+        STATE_BUCKET: ${{ inputs.state-bucket }}
+        STATE_REGION: ${{ inputs.state-region }}
+      run: |
+        terraform -chdir=terraform init \
+          -input=false \
+          -backend-config="bucket=${STATE_BUCKET}" \
+          -backend-config="key=api/${STAGE}/terraform.tfstate" \
+          -backend-config="region=${STATE_REGION}" \
+          -backend-config="use_lockfile=true" \
+          -backend-config="encrypt=true"
+
+    - name: Plan infrastructure and application update
+      shell: bash
+      env:
+        AWS_REGION: ${{ inputs.aws-region }}
+        STAGE: ${{ inputs.environment-name }}
+      run: |
+        terraform -chdir=terraform plan \
+          -input=false \
+          -out=tfplan \
+          -var-file="environments/${STAGE}.tfvars" \
+          -var="aws_region=${AWS_REGION}"
+
+    - name: Apply deployment
+      shell: bash
+      run: terraform -chdir=terraform apply -input=false -auto-approve tfplan
+
+    - name: Smoke check API
+      shell: bash
+      run: |
+        api_url="$(terraform -chdir=terraform output -raw api_url)"
+        curl --fail --silent --show-error \
+          --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 30 \
+          --max-time 10 --output /dev/null "${api_url%/}/items"
+
+    - name: Roll back Lambda alias
+      if: failure() && steps.previous.outputs.version != ''
+      shell: bash
+      env:
+        STAGE: ${{ inputs.environment-name }}
+        PREVIOUS_VERSION: ${{ steps.previous.outputs.version }}
+      run: |
+        aws lambda update-alias \
+          --function-name "api-${STAGE}" \
+          --name live \
+          --function-version "$PREVIOUS_VERSION"
+
+    - name: Report first-deploy rollback limit
+      if: failure() && steps.previous.outputs.version == ''
+      shell: bash
+      run: echo "No prior Lambda version exists to restore on this first deployment."
